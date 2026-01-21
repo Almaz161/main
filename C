@@ -1,0 +1,84 @@
+const int PIN_ECG = A0;
+
+// ПОВЫСЬТЕ ПОРОГ, если при разговоре все равно много мусора.
+// Попробуйте 600, 620, 650.
+int Threshold = 600; 
+
+unsigned long lastBeatTime = 0;
+const int MIN_DELAY = 350; // Минимальная задержка (фильтр дребезга ~170 bpm макс)
+
+// НАСТРОЙКИ СГЛАЖИВАНИЯ
+const int NUM_READINGS = 10; // Сколько ударов усреднять
+int readings[NUM_READINGS];  // Массив для хранения ударов
+int readIndex = 0;           // Текущая позиция в массиве
+long total = 0;              // Сумма всех значений
+int averageBPM = 0;          // Итоговый средний пульс
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(10, INPUT); 
+  pinMode(11, INPUT);
+  
+  // Заполняем массив нулями (или средним значением 70 для старта)
+  for (int i = 0; i < NUM_READINGS; i++) {
+    readings[i] = 70;
+    total += 70;
+  }
+}
+
+void loop() {
+  // Проверка обрыва
+  if ((digitalRead(10) == 1) || (digitalRead(11) == 1)) {
+    Serial.println(0); 
+    delay(20);
+    return;
+  }
+
+  int signal = analogRead(PIN_ECG);
+  unsigned long currentTime = millis();
+
+  // Детекция удара
+  if (signal > Threshold && (currentTime - lastBeatTime > MIN_DELAY)) {
+    
+    unsigned long delta = currentTime - lastBeatTime;
+    lastBeatTime = currentTime;
+
+    int instantBPM = 60000 / delta;
+
+    // Фильтр нереальных значений (сердце в покое не бьется > 180 и < 40)
+    if (instantBPM > 40 && instantBPM < 180) {
+      
+      // --- АЛГОРИТМ СКОЛЬЗЯЩЕГО СРЕДНЕГО ---
+      // 1. Вычитаем последнее значение из суммы
+      total = total - readings[readIndex];
+      
+      // 2. Записываем новое значение от датчика
+      readings[readIndex] = instantBPM;
+      
+      // 3. Добавляем новое значение к сумме
+      total = total + readings[readIndex];
+      
+      // 4. Двигаем индекс
+      readIndex = readIndex + 1;
+      if (readIndex >= NUM_READINGS) {
+        readIndex = 0;
+      }
+      
+      // 5. Считаем среднее
+      averageBPM = total / NUM_READINGS;
+      
+      // Выводим сглаженное значение
+      Serial.println(averageBPM);
+    }
+  } 
+  
+  // Если ударов нет долго (3 сек) -> сброс
+  if (currentTime - lastBeatTime > 3000) {
+    Serial.println(0);
+    // Сброс фильтра к дефолту, чтобы при появлении пальца не ждать долго
+    for (int i = 0; i < NUM_READINGS; i++) { readings[i] = 70; }
+    total = 70 * NUM_READINGS;
+  }
+  
+  delay(10);
+}
