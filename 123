@@ -1,0 +1,231 @@
+import requests
+import json
+import time
+import os
+import threading
+
+# ==========================================
+# КОНФИГУРАЦИЯ
+# ==========================================
+API_KEY = 'AQ.Ab8RN6KXN_hV-EpOzewuugwdYnT1dc0z1YHXTt4y_rrnQmPGHw'
+BASE_URL = 'https://jules.googleapis.com/v1alpha'
+
+SESSION_FILE = os.path.join(os.path.dirname(__file__), '.jules_session')
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), 'otv')
+
+headers = {
+    'x-goog-api-key': API_KEY,
+    'Content-Type': 'application/json'
+}
+
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
+
+# ==========================================
+# ПАМЯТЬ СЕССИЙ
+# ==========================================
+def load_session():
+    if os.path.exists(SESSION_FILE):
+        with open(SESSION_FILE, 'r', encoding='utf-8') as f:
+            return f.read().strip()
+    return None
+
+def save_session(session_name):
+    with open(SESSION_FILE, 'w', encoding='utf-8') as f:
+        f.write(session_name)
+
+def clear_session():
+    if os.path.exists(SESSION_FILE):
+        os.remove(SESSION_FILE)
+
+def get_next_filename():
+    counter = 1
+    while True:
+        filename = f"{counter}.txt"
+        filepath = os.path.join(OUTPUT_DIR, filename)
+        if not os.path.exists(filepath):
+            return filepath, filename
+        counter += 1
+
+# ==========================================
+# ФУНКЦИИ JULES API
+# ==========================================
+def create_session(prompt):
+    url = f"{BASE_URL}/sessions"
+    try:
+        response = requests.post(url, headers=headers, json={"prompt": prompt, "title": "Терминальная сессия"})
+        return response.json().get('name') if response.status_code == 200 else None
+    except:
+        return None
+
+def send_message(session_name, prompt):
+    url = f"{BASE_URL}/{session_name}:sendMessage"
+    try:
+        response = requests.post(url, headers=headers, json={"prompt": prompt})
+        return response.status_code == 200
+    except:
+        return False
+
+def get_activities_list(session_name):
+    url = f"{BASE_URL}/{session_name}/activities"
+    try:
+        response = requests.get(url, headers=headers)
+        return response.json().get('activities', []) if response.status_code == 200 else []
+    except:
+        return []
+
+def log_activity_to_file(activity):
+    collected_texts = []
+
+    if 'agentMessaged' in activity and 'agentMessage' in activity['agentMessaged']:
+        collected_texts.append(activity['agentMessaged']['agentMessage'])
+    if 'completion' in activity and 'text' in activity['completion']:
+        collected_texts.append(activity['completion']['text'])
+    if 'agentMessage' in activity and 'text' in activity['agentMessage']:
+        collected_texts.append(activity['agentMessage']['text'])
+
+    try:
+        if 'codeChanges' in activity:
+            for change in activity['codeChanges'].get('changes', []):
+                file_path = change.get('path', 'unknown_file')
+                file_content = change.get('content', '')
+                if file_content:
+                    collected_texts.append(f"📝 ИСХОДНЫЙ КОД ФАЙЛА [{file_path}]:\n{file_content}")
+    except:
+        pass
+
+    if 'planGenerated' in activity:
+        try:
+            steps = activity['planGenerated']['plan']['steps']
+            plan_lines = ["📋 АГЕНТ СФОРМИРОВАЛ ПЛАН РАБОТЫ:"]
+            for step in steps:
+                plan_lines.append(f"  [{step.get('index')}] {step.get('title')}: {step.get('description', '')}")
+            collected_texts.append("\n".join(plan_lines))
+        except:
+            collected_texts.append("📋 Сгенерирован новый план действий.")
+
+    final_text = "\n\n".join([t for t in collected_texts if t and t.strip()])
+
+    if final_text:
+        full_path, short_name = get_next_filename()
+        with open(full_path, 'w', encoding='utf-8') as f:
+            f.write(final_text)
+        print(f"\n📥 [Поймано действие!] Файл сохранен в: otv/{short_name}\n")
+        return True
+    return False
+
+# ==========================================
+# ФОНОВЫЙ ПОТОК МОНИТОРИНГА ОТВЕТОВ
+# ==========================================
+def background_listener(session_name, initial_count):
+    activities_count_before = initial_count
+    while True:
+        time.sleep(5)
+        current_activities = get_activities_list(session_name)
+
+        if len(current_activities) > activities_count_before:
+            new_activities = current_activities[activities_count_before:]
+            activities_count_before = len(current_activities)
+
+            for activity in new_activities:
+                if activity.get('originator') == 'agent':
+                    log_activity_to_file(activity)
+
+            raw_new = json.dumps(new_activities)
+            if '"COMPLETED"' in raw_new or '"SUCCEEDED"' in raw_new or "Ready for review" in raw_new:
+                print("\n🏁 Агент выполнил текущую задачу!")
+
+# ==========================================
+# СТАБИЛЬНЫЙ ДВУХШАГОВЫЙ ВВОД
+# ==========================================
+def get_jules_prompt():
+    # Шаг 1: Принимаем основной код/текст через стандартный input()
+    print("\n[Шаг 1] Вставьте основной код/текст и нажмите Enter:")
+    try:
+        base_text = input("> ").strip()
+    except (KeyboardInterrupt, EOFError):
+        return "exit"
+
+    if not base_text:
+        return ""
+
+    if base_text.lower() in ['exit', 'quit', '/new']:
+        return base_text
+
+    # СХЛОПЫВАНИЕ: Очищаем терминал и делаем аккуратное превью до 3 фраз (слов)
+    os.system('clear')
+    words = base_text.split()
+    preview = " ".join(words[:15]) + ("..." if len(words) > 15 else "")
+
+    print("==================================================")
+    print(f"📋 Код успешно схлопнут до превью:\n«{preview}»")
+    print("==================================================")
+
+    # Шаг 2: Дополнение промпта вопросом пользователя
+    print("\n[Шаг 2] Напишите ваш вопрос к этому коду и нажмите Enter:")
+    try:
+        user_comment = input("> ").strip()
+    except (KeyboardInterrupt, EOFError):
+        return "exit"
+
+    # Склеиваем итоговый запрос
+    if user_comment:
+        return f"{user_comment}\n\nКонтекст/Код:\n{base_text}"
+    return base_text
+
+# ==========================================
+# ОСНОВНОЙ ЦИКЛ ПРОГРАММЫ
+# ==========================================
+def main():
+    print("==================================================")
+    print("🤖 Jules AI: Интерактивный Терминал v7.0 запущен!")
+    print("📁 Все ответы улетают в папку: otv/")
+    print("Команды на Шаге 1: /new (сбросить память), exit (выход)")
+    print("==================================================\n")
+
+    session_name = load_session()
+    initial_activities = []
+
+    if session_name:
+        print(f"✅ Найдена активная сессия (ID: ...{session_name[-10:]})")
+        initial_activities = get_activities_list(session_name)
+        listener_thread = threading.Thread(target=background_listener, args=(session_name, len(initial_activities)), daemon=True)
+        listener_thread.start()
+    else:
+        print("✨ Сессия чиста. Я готов к первой задаче.")
+
+    while True:
+        final_prompt = get_jules_prompt()
+
+        if final_prompt.lower() in ['exit', 'quit']:
+            print("Выход из программы...")
+            break
+        elif final_prompt.lower() == '/new':
+            clear_session()
+            print("🔄 Память стерта! Пожалуйста, перезапустите скрипт для чистой сессии.\n")
+            break
+        elif not final_prompt:
+            continue
+
+        session_name = load_session()
+
+        if not session_name:
+            print("\n🚀 Создаем новую сессию на сервере...")
+            session_name = create_session(final_prompt)
+            if not session_name:
+                print("❌ Ошибка: проверьте API-ключ.")
+                continue
+            save_session(session_name)
+
+            initial_acts = get_activities_list(session_name)
+            listener_thread = threading.Thread(target=background_listener, args=(session_name, len(initial_acts)), daemon=True)
+            listener_thread.start()
+            print("📡 Фоновый мониторинг запущен.")
+        else:
+            if not send_message(session_name, final_prompt):
+                print("❌ Не удалось отправить сообщение. Возможно, напишите /new")
+                continue
+            print("\n🚀 Задача успешно склеена и отправлена агенту Jules.")
+
+if __name__ == "__main__":
+    main()
